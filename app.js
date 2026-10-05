@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   const CFG = window.APP_CONFIG || {};
-  const VERSION = '1.0';
+  const VERSION = '1.1';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const SCOPE = 'openid profile offline_access User.Read Files.ReadWrite';
   const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -30,7 +30,7 @@
     loadedAt: store.get('loadedAt', 0),
     pending: store.get('pending', {}),
     view: 'today', day: null, planDay: null,
-    showUnplanned: false, modal: null,
+    showUnplanned: false, modal: null, browse: null,
     sync: 'idle', syncMsg: '', needLogin: false,
     files: null, setupError: '', toast: '',
   };
@@ -121,14 +121,35 @@
   }
 
   async function findFiles() {
-    const seen = new Map();
+    const seen = new Map(); const errors = []; let ok = 0;
     const add = (arr) => (arr || []).forEach((f) => { if (f.file && /\.xlsx$/i.test(f.name) && !seen.has(f.id)) seen.set(f.id, f); });
-    try { const f = await graphJson(`/me/drive/root:/${encodeURIComponent(CFG.defaultFileName || 'Suivi-habitudes.xlsx')}`); add([f]); } catch {}
-    for (const q of ['habitudes', 'suivi', 'xlsx']) {
-      try { const j = await graphJson(`/me/drive/root/search(q='${q}')?$top=100&$select=id,name,file,parentReference,lastModifiedDateTime`); add(j.value); } catch {}
-    }
-    try { const j = await graphJson(`/me/drive/recent?$top=50`); add((j.value || []).map((x) => ({ ...x, ...(x.remoteItem || {}), id: (x.remoteItem && x.remoteItem.id) || x.id }))); } catch {}
+    const tryGet = async (path, pick) => {
+      try { const j = await graphJson(path); ok++; add(pick(j)); }
+      catch (e) { if (e instanceof NeedLogin) throw e; if (e.status !== 404) errors.push(e.status || e.message); else ok++; }
+    };
+    await tryGet(`/me/drive/root:/${encodeURIComponent(CFG.defaultFileName || 'Suivi-habitudes.xlsx')}`, (f) => [f]);
+    await tryGet(`/me/drive/root/children?$top=200`, (j) => j.value);
+    for (const q of ['habitudes', 'suivi', 'xlsx']) await tryGet(`/me/drive/root/search(q='${q}')?$top=100`, (j) => j.value);
+    if (!ok) { const e = new Error('graph'); e.userMsg = `OneDrive ne répond pas à l'application (erreur ${errors[0]}). Vérifiez que vous êtes connecté avec le bon compte Microsoft.`; throw e; }
     return [...seen.values()].sort((a, b) => (b.lastModifiedDateTime || '').localeCompare(a.lastModifiedDateTime || ''));
+  }
+
+  /* Explorateur de dossiers OneDrive (ne dépend pas de l'index de recherche) */
+  async function browse(folder) {
+    S.browse = { stack: S.browse ? S.browse.stack : [], items: null };
+    if (folder === 'up') S.browse.stack.pop(); else if (folder) S.browse.stack.push(folder); else S.browse.stack = [];
+    render();
+    const cur = S.browse.stack[S.browse.stack.length - 1];
+    try {
+      const j = await graphJson(cur ? `/me/drive/items/${cur.id}/children?$top=200` : '/me/drive/root/children?$top=200');
+      S.browse.items = (j.value || []).filter((x) => x.folder || (x.file && /\.xlsx$/i.test(x.name)))
+        .sort((a, b) => (!!b.folder - !!a.folder) || a.name.localeCompare(b.name, 'fr'));
+      S.setupError = '';
+    } catch (e) {
+      if (e instanceof NeedLogin) return onNeedLogin();
+      S.browse.items = []; S.setupError = `Impossible d'ouvrir ce dossier OneDrive (erreur ${e.status || e.message}).`;
+    }
+    render();
   }
 
   async function load(silent) {
@@ -392,11 +413,24 @@
       <div class="card"><p style="margin:0 0 4px;line-height:1.45">Connectez-vous avec le compte Microsoft qui contient votre fichier sur OneDrive.</p>
       <button class="btn" data-act="login">Se connecter avec Microsoft</button>
       <button class="btn ghost" data-act="resetcid">Modifier l'ID d'application</button></div>`;
-    else body = `
+    else if (S.browse) {
+      const st = S.browse.stack; const here = st.length ? st[st.length - 1].name : 'Mon OneDrive';
+      body = `
+      <div class="card" style="padding:2px 0">
+        <div class="pick" style="font-weight:700">${st.length ? '<button data-act="browseup" style="color:var(--green);font-weight:700">‹ Retour</button>' : ''}<span style="flex:1;text-align:${st.length ? 'right' : 'left'}">📂 ${esc(here)}</span></div>
+        ${S.browse.items == null ? '<div class="spinner" style="margin:24px auto"></div>'
+          : S.browse.items.length ? S.browse.items.map((f) => f.folder
+            ? `<button class="pick" data-act="browsein" data-id="${esc(f.id)}" data-name="${esc(f.name)}"><span>📁 ${esc(f.name)}<small>${f.folder.childCount != null ? f.folder.childCount + ' élément(s)' : 'Dossier'}</small></span>›</button>`
+            : `<button class="pick" data-act="pickfile" data-id="${esc(f.id)}" data-name="${esc(f.name)}"><span>📗 ${esc(f.name)}<small>Fichier Excel</small></span><b style="color:var(--green)">Choisir</b></button>`).join('')
+          : '<div class="empty">Aucun dossier ni fichier Excel ici.</div>'}</div>
+      <button class="btn ghost" data-act="findfiles">Revenir à la recherche</button>`;
+    } else body = `
       <div class="card" style="padding:2px 0">${S.files == null ? '<div class="spinner"></div><div class="empty" style="padding-top:0">Recherche de vos fichiers Excel…</div>'
-        : S.files.length ? S.files.map((f) => `<button class="pick" data-act="pickfile" data-id="${esc(f.id)}" data-name="${esc(f.name)}"><span>${esc(f.name)}<small>${esc((f.parentReference && f.parentReference.path || '').replace(/^\/drive\/root:?/, '') || 'OneDrive')}</small></span>›</button>`).join('')
-        : `<div class="empty">Aucun fichier Excel trouvé. Déposez « ${esc(CFG.defaultFileName)} » dans votre OneDrive puis réessayez.</div>`}</div>
+        : S.files.length ? S.files.map((f) => `<button class="pick" data-act="pickfile" data-id="${esc(f.id)}" data-name="${esc(f.name)}"><span>${esc(f.name)}<small>${esc(decodeURIComponent((f.parentReference && f.parentReference.path || '').replace(/^\/drive\/root:?/, '')) || 'Mon OneDrive')}</small></span>›</button>`).join('')
+        : `<div class="empty">La recherche n'a trouvé aucun fichier Excel. Parcourez vos dossiers ci-dessous.</div>`}</div>
+      <button class="btn" data-act="browse">Parcourir mon OneDrive</button>
       <button class="btn ghost" data-act="findfiles">Rechercher à nouveau</button>`;
+    if (step === 3) body += `<p style="text-align:center;color:var(--muted);font-size:13px;margin-top:18px">Connecté : ${esc((S.user && (S.user.mail || S.user.name)) || 'compte Microsoft')}<br><button data-act="logout" style="color:var(--today);font-weight:600;margin-top:6px">Changer de compte</button></p>`;
     const titles = ['', 'Bienvenue', 'Connexion', 'Votre fichier'];
     return `<div class="welcome"><img src="icons/icon-192.png" alt=""><h1>${titles[step]}</h1><p>${step === 3 ? 'Choisissez votre fichier de suivi d’habitudes.' : 'Votre suivi d’habitudes, relié à votre fichier Excel sur OneDrive.'}</p></div>
       ${S.setupError ? `<div class="banner warn">${esc(S.setupError)}</div>` : ''}${body}`;
@@ -492,18 +526,23 @@
         ['tokens', 'user', 'file', 'model', 'pending', 'sheet', 'loadedAt'].forEach((k) => store.set(k, null));
         Object.assign(S, { tokens: null, user: null, file: null, model: null, pending: {}, sheet: null, view: 'today', files: null });
         location.assign(`${authBase()}/logout?post_logout_redirect_uri=${encodeURIComponent(redirectUri())}`); break;
-      case 'choosefile': S.file = null; S.files = null; store.set('file', null); render(); runFind(); break;
-      case 'findfiles': S.files = null; render(); runFind(); break;
+      case 'choosefile': S.file = null; S.files = null; S.browse = null; store.set('file', null); render(); runFind(); break;
+      case 'findfiles': S.files = null; S.browse = null; render(); runFind(); break;
+      case 'browse': browse(null); break;
+      case 'browsein': browse({ id: el.dataset.id, name: el.dataset.name }); break;
+      case 'browseup': browse('up'); break;
       case 'pickfile':
-        S.file = { id: el.dataset.id, name: el.dataset.name }; store.set('file', S.file);
+        S.file = { id: el.dataset.id, name: el.dataset.name }; store.set('file', S.file); S.browse = null;
         S.model = null; S.sheet = null; S.pending = {}; store.set('pending', {}); render(); load(); break;
     }
   });
 
   async function runFind() {
     try { S.files = await findFiles(); S.setupError = ''; }
-    catch (e) { if (e instanceof NeedLogin) return onNeedLogin(); S.files = []; S.setupError = 'Impossible de lister vos fichiers OneDrive.'; }
-    if (S.files && S.files.length === 1 && !S.file && /habitudes/i.test(S.files[0].name)) { S.file = { id: S.files[0].id, name: S.files[0].name }; store.set('file', S.file); load(); }
+    catch (e) { if (e instanceof NeedLogin) return onNeedLogin(); S.files = []; S.setupError = e.userMsg || 'Impossible de lister vos fichiers OneDrive.'; }
+    const hab = S.files.filter((f) => /habitudes/i.test(f.name));
+    if (hab.length === 1 && !S.file) { S.file = { id: hab[0].id, name: hab[0].name }; store.set('file', S.file); load(); }
+    else if (!S.files.length && !S.setupError) { browse(null); return; }
     render();
   }
 
