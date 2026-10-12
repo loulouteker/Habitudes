@@ -2,11 +2,10 @@
 (function () {
   'use strict';
   const CFG = window.APP_CONFIG || {};
-  const VERSION = '1.1';
+  const VERSION = '1.2';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const SCOPE = 'openid profile offline_access User.Read Files.ReadWrite';
   const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-  const WEEK_COLS = ['F', 'I', 'L', 'O', 'R'];
   const DAYS_SHORT = ['L', 'M', 'M', 'J', 'V', 'S', 'D'];
   const DAYS_LONG = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
   const MONTHS_LOWER = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
@@ -26,9 +25,9 @@
     user: store.get('user', null),
     file: store.get('file', null), // {id, name}
     sheet: store.get('sheet', null),
-    model: store.get('model', null),
+    model: (store.get('model', null) || {}).version === 2 ? store.get('model', null) : null,
     loadedAt: store.get('loadedAt', 0),
-    pending: store.get('pending', {}),
+    pending: (store.get('model', null) || {}).version === 2 ? store.get('pending', {}) : {},
     view: 'today', day: null, planDay: null,
     showUnplanned: false, modal: null, browse: null,
     sync: 'idle', syncMsg: '', needLogin: false,
@@ -127,7 +126,7 @@
       try { const j = await graphJson(path); ok++; add(pick(j)); }
       catch (e) { if (e instanceof NeedLogin) throw e; if (e.status !== 404) errors.push(e.status || e.message); else ok++; }
     };
-    await tryGet(`/me/drive/root:/${encodeURIComponent(CFG.defaultFileName || 'Suivi-habitudes.xlsx')}`, (f) => [f]);
+    for (const n of [...new Set([CFG.defaultFileName, 'Habitudes.xlsx', 'Suivi-habitudes.xlsx'].filter(Boolean))]) await tryGet(`/me/drive/root:/${encodeURIComponent(n)}`, (f) => [f]);
     await tryGet(`/me/drive/root/children?$top=200`, (j) => j.value);
     for (const q of ['habitudes', 'suivi', 'xlsx']) await tryGet(`/me/drive/root/search(q='${q}')?$top=100`, (j) => j.value);
     if (!ok) { const e = new Error('graph'); e.userMsg = `OneDrive ne répond pas à l'application (erreur ${errors[0]}). Vérifiez que vous êtes connecté avec le bon compte Microsoft.`; throw e; }
@@ -239,10 +238,11 @@
       const t = model.trackers.find((x) => x.sheetName === sh); if (!t) continue;
       for (const [addr, val] of Object.entries(cells)) {
         const m = /^([A-Z]+)(\d+)$/.exec(addr); const col = m[1], row = +m[2], on = !!val;
-        if (col === 'AL') { const it = t.monthly.find((x) => x.row === row); if (it) it.done = on; continue; }
+        if (!t.cols) continue;
+        if (col === t.cols.monthDone) { const it = t.monthly.find((x) => x.row === row); if (it) it.done = on; continue; }
         const h = t.habits.find((x) => x.row === row);
-        if (h) { const d = XL.colToNum(col) - 5; if (d >= 1 && d <= t.daysInMonth) h.checks[d - 1] = on; continue; }
-        const w = t.weekly.find((x) => x.row === row); const wi = WEEK_COLS.indexOf(col);
+        if (h) { const d = XL.colToNum(col) - t.cols.day1 + 1; if (d >= 1 && d <= t.daysInMonth) h.checks[d - 1] = on; continue; }
+        const w = t.weekly.find((x) => x.row === row); const wi = t.cols.week.indexOf(col);
         if (w && wi >= 0) w.weeks[wi] = on;
       }
     }
@@ -311,9 +311,10 @@
     }).join('');
     const sections = [];
     planned.forEach((h) => { let s = sections.find((x) => x.name === h.section); if (!s) sections.push((s = { name: h.section, items: [] })); s.items.push(h); });
+    sections.forEach((s) => s.items.sort((a, b) => XL.timeMinutes(a.times[wd - 1]) - XL.timeMinutes(b.times[wd - 1])));
     const row = (h, extra = '') => `<button class="habit ${h.checks[d - 1] ? 'done' : ''} ${extra}" data-act="toggle" data-row="${h.row}" data-day="${d}">
         <span class="dot" style="background:${color(h.domain)}"></span>
-        <span class="nm"><b>${esc(h.name)}</b><small>${esc(h.domain || '')}</small></span>
+        <span class="nm"><b>${esc(h.name)}</b><small>${esc([h.times[wd - 1] || h.time, h.domain].filter(Boolean).join(' · '))}</small></span>
         <span class="check">${ICON.check}</span></button>`;
     return `
       <div class="days" id="days">${strip}</div>
@@ -356,29 +357,47 @@
     return `
       <h2 style="margin-top:12px">Habitudes hebdomadaires</h2>
       ${t.weekly.length ? t.weekly.map((w) => `<div class="card goal"><div class="l1"><b>${esc(w.name)}</b><span>${w.weeks.filter(Boolean).length} / ${w.objective}</span></div>
-        <div style="font-size:12.5px;color:var(--muted);margin-top:2px"><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color(w.domain)};margin-right:6px"></span>${esc(w.domain)}</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:2px"><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color(w.domain)};margin-right:6px"></span>${esc([w.domain, w.weekday ? DAYS_LONG[w.weekday - 1] + (w.time ? ' ' + w.time : '') : w.time].filter(Boolean).join(' · '))}</div>
         <div class="weeks">${w.weeks.map((on, i) => `<button class="wk ${on ? 'on' : ''} ${i + 1 === curWeek ? 'cur' : ''}" data-act="week" data-row="${w.row}" data-w="${i}">S${i + 1}</button>`).join('')}</div></div>`).join('')
         : '<div class="empty card">Aucune habitude hebdomadaire dans le fichier.</div>'}
       <h2>À faire ce mois-ci</h2>
       <div class="card" style="padding:2px 0">${t.monthly.length ? t.monthly.map((m) => `<button class="todo ${m.done ? 'on' : ''}" data-act="monthly" data-row="${m.row}"><span class="box">${ICON.check}</span><span>${esc(m.name)}</span></button>`).join('') : '<div class="empty">Rien de prévu ce mois-ci.</div>'}</div>`;
   }
 
-  function vPlan() {
-    const p = S.model.planning;
-    if (!p || !p.blocks.length) return '<div class="empty">Aucun onglet « Planning » trouvé dans le fichier.</div>';
+  function vPlan(t) {
     const todayWd = XL.excelWeekday(now());
     if (!S.planDay) S.planDay = todayWd;
-    const block = p.blocks.find((b) => b.weekday === XL.norm(DAYS_LONG[S.planDay - 1]));
-    const notes = p.blocks.find((b) => b.weekday === 'notes');
-    const mins = (s) => { const m = /(\d{1,2})h(\d{0,2})/.exec(s || ''); return m ? +m[1] * 60 + (+m[2] || 0) : null; };
+    const seg = `<div class="seg" style="margin-top:8px">${DAYS_SHORT.map((l, i) => `<button class="${S.planDay === i + 1 ? 'on' : ''} ${todayWd === i + 1 ? 'today' : ''}" data-act="planday" data-d="${i + 1}">${l}</button>`).join('')}</div>`;
     const nowM = now().getHours() * 60 + now().getMinutes();
+    if (!t.hasTimes) return seg + vPlanSheet(todayWd, nowM);
+    // Planning calculé depuis le Tracker (heure habituelle ou heure du jour), comme dans le fichier
+    const wd = S.planDay, n = now();
+    const date = new Date(n.getFullYear(), n.getMonth(), n.getDate() + (wd - todayWd));
+    const d = date.getFullYear() === t.year && date.getMonth() === t.monthIdx ? date.getDate() : null;
+    const items = [];
+    t.habits.forEach((h) => { if (h.planned[wd - 1]) items.push({ time: h.times[wd - 1], label: h.name, domain: h.domain, row: h.row, done: d ? h.checks[d - 1] : null }); });
+    t.weekly.forEach((w) => { if (w.weekday === wd) items.push({ time: w.time, label: w.name, domain: w.domain, weekly: true }); });
+    items.sort((a, b) => XL.timeMinutes(a.time) - XL.timeMinutes(b.time));
     let nowIdx = -1;
-    if (block && S.planDay === todayWd) block.items.forEach((it, i) => { const m = mins(it.time); if (m != null && m <= nowM) nowIdx = i; });
-    return `
-      <div class="seg" style="margin-top:8px">${DAYS_SHORT.map((l, i) => `<button class="${S.planDay === i + 1 ? 'on' : ''} ${todayWd === i + 1 ? 'today' : ''}" data-act="planday" data-d="${i + 1}">${l}</button>`).join('')}</div>
-      <h2>${DAYS_LONG[S.planDay - 1]}</h2>
-      <div class="card"><div class="timeline">${block && block.items.length ? block.items.map((it, i) => `<div class="ti ${i === nowIdx ? 'now' : ''} ${nowIdx >= 0 && i < nowIdx ? 'past' : ''}"><time>${esc(it.time)}</time><span class="pt"></span><span>${i === nowIdx ? '<b>En ce moment</b>' : ''}${esc(it.label)}</span></div>`).join('') : '<div class="empty">Rien de planifié ce jour-là.</div>'}</div></div>
-      ${notes && notes.items.length ? `<h2>Notes de la semaine</h2><div class="card">${notes.items.map((n) => `<p style="margin:6px 0">${esc((n.time ? n.time + ' · ' : '') + n.label)}</p>`).join('')}</div>` : ''}`;
+    if (wd === todayWd) items.forEach((it, i) => { if (XL.timeMinutes(it.time) <= nowM) nowIdx = i; });
+    return `${seg}
+      <h2>${DAYS_LONG[wd - 1]} ${date.getDate()} ${MONTHS_LOWER[date.getMonth()]}</h2>
+      <div class="card"><div class="timeline">${items.length ? items.map((it, i) => `<div class="ti ${i === nowIdx ? 'now' : ''} ${nowIdx >= 0 && i < nowIdx ? 'past' : ''}">
+        <time>${esc(it.time || '—')}</time><span class="pt" style="border-color:${color(it.domain)}"></span>
+        <span>${i === nowIdx ? '<b>En ce moment</b>' : ''}${esc(it.label)}${it.weekly ? ' <small style="color:var(--muted)">· hebdo</small>' : ''}</span>
+        ${it.done != null ? `<button class="tick ${it.done ? 'on' : ''}" data-act="toggle" data-row="${it.row}" data-day="${d}" aria-label="Cocher">${ICON.check}</button>` : '<span></span>'}</div>`).join('')
+        : '<div class="empty">Rien de planifié ce jour-là.</div>'}</div></div>
+      <p style="color:var(--muted);font-size:12.5px;text-align:center;margin-top:12px">Les heures viennent du Tracker : heure habituelle, ou heure du jour si vous en avez mis une.</p>`;
+  }
+
+  function vPlanSheet(todayWd, nowM) {
+    const p = S.model.planning;
+    if (!p || !p.blocks.length) return '<div class="empty">Aucun onglet « Planning » trouvé dans le fichier.</div>';
+    const block = p.blocks.find((b) => b.weekday === XL.norm(DAYS_LONG[S.planDay - 1]));
+    let nowIdx = -1;
+    if (block && S.planDay === todayWd) block.items.forEach((it, i) => { if (XL.timeMinutes(it.time) <= nowM) nowIdx = i; });
+    return `<h2>${DAYS_LONG[S.planDay - 1]}</h2>
+      <div class="card"><div class="timeline">${block && block.items.length ? block.items.map((it, i) => `<div class="ti ${i === nowIdx ? 'now' : ''} ${nowIdx >= 0 && i < nowIdx ? 'past' : ''}"><time>${esc(it.time)}</time><span class="pt"></span><span>${i === nowIdx ? '<b>En ce moment</b>' : ''}${esc(it.label)}</span><span></span></div>`).join('') : '<div class="empty">Rien de planifié ce jour-là.</div>'}</div></div>`;
   }
 
   function vSettings() {
@@ -505,10 +524,10 @@
       case 'unplanned': S.showUnplanned = !S.showUnplanned; render(); break;
       case 'toggle': {
         const h = t.habits.find((x) => x.row === +el.dataset.row); const d = +el.dataset.day;
-        queueEdit(t.sheetName, XL.numToCol(5 + d) + h.row, h.checks[d - 1] ? '' : 'x'); break;
+        queueEdit(t.sheetName, XL.numToCol(t.cols.day1 + d - 1) + h.row, h.checks[d - 1] ? '' : 'x'); break;
       }
-      case 'week': { const w = t.weekly.find((x) => x.row === +el.dataset.row); const i = +el.dataset.w; queueEdit(t.sheetName, WEEK_COLS[i] + w.row, w.weeks[i] ? '' : 'x'); break; }
-      case 'monthly': { const m = t.monthly.find((x) => x.row === +el.dataset.row); queueEdit(t.sheetName, 'AL' + m.row, m.done ? '' : 'x'); break; }
+      case 'week': { const w = t.weekly.find((x) => x.row === +el.dataset.row); const i = +el.dataset.w; queueEdit(t.sheetName, t.cols.week[i] + w.row, w.weeks[i] ? '' : 'x'); break; }
+      case 'monthly': { const m = t.monthly.find((x) => x.row === +el.dataset.row); queueEdit(t.sheetName, t.cols.monthDone + m.row, m.done ? '' : 'x'); break; }
       case 'habit': S.modal = +el.dataset.row; render(); break;
       case 'close': S.modal = null; render(); break;
       case 'planday': S.planDay = +el.dataset.d; render(); break;

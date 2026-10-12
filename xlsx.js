@@ -65,45 +65,105 @@
   /* ---------- Modèle métier ---------- */
   const isX = (cell) => !!cell && typeof cell.v === 'string' && cell.v.trim().toLowerCase() === 'x';
   const str = (cell) => (cell && cell.v != null ? String(cell.v).trim() : '');
-  const WEEKDAY_COLS = ['AP', 'AQ', 'AR', 'AS', 'AT', 'AU', 'AV']; // L M M J V S D
-  const WEEK_COLS = ['F', 'I', 'L', 'O', 'R'];
   const excelWeekday = (date) => ((date.getDay() + 6) % 7) + 1; // lundi = 1
 
-  function looksLikeTracker(cells) { return cells && MONTHS.includes(norm(str(cells.D2))) && typeof (cells.D3 && cells.D3.v) === 'number'; }
+  /* Heures : « 7h00 », « 7:00 » ou une heure Excel (fraction de jour) → « 7h00 » */
+  function fmtTime(cell) {
+    if (!cell || cell.v == null || cell.v === '') return '';
+    if (typeof cell.v === 'number') {
+      if (cell.v > 0 && cell.v < 1) { const m = Math.round(cell.v * 1440); return Math.floor(m / 60) + 'h' + String(m % 60).padStart(2, '0'); }
+      return '';
+    }
+    const m = /^(\d{1,2})\s*[h:]\s*(\d{0,2})/i.exec(String(cell.v).trim());
+    return m ? +m[1] + 'h' + (m[2] || '00').padStart(2, '0') : '';
+  }
+  const timeMinutes = (t) => { const m = /^(\d{1,2})h(\d{2})$/.exec(t || ''); return m ? +m[1] * 60 + +m[2] : 9999; };
 
-  function trackerModel(cells, sheetName) {
-    const monthIdx = MONTHS.indexOf(norm(str(cells.D2)));
-    const year = cells.D3.v;
+  /* Repère les colonnes d'après leurs titres : l'app suit le fichier même si on déplace des colonnes */
+  function layout(cells) {
+    const where = {}; // texte normalisé → [{row, col}]
+    for (const [a, c] of Object.entries(cells)) {
+      if (typeof c.v !== 'string' || !c.v.trim()) continue;
+      const k = norm(c.v); const { col, row } = splitAddr(a);
+      (where[k] = where[k] || []).push({ row, col });
+    }
+    const first = (k, filter = () => true) => (where[norm(k)] || []).filter(filter).sort((x, y) => x.row - y.row || x.col - y.col)[0];
+    const at = (row, col) => cells[numToCol(col) + row];
+
+    // Mois et année : la première valeur à droite des libellés « Mois » et « Année »
+    const right = (lbl, test) => { const p = first(lbl, (x) => x.row <= 8); if (!p) return null; for (let c = p.col + 1; c <= p.col + 6; c++) { const v = at(p.row, c); if (v && test(v)) return v; } return null; };
+    const mCell = right('Mois', (v) => MONTHS.includes(norm(v.v)));
+    const yCell = right('Année', (v) => typeof v.v === 'number');
+    if (!mCell || !yCell) return null;
+
+    const nameH = first('Suivi des habitudes'); if (!nameH) return null;
+    const R = nameH.row; const inRow = (k) => first(k, (x) => x.row === R);
+    const timeH = inRow('Heure'), domH = inRow('Domaine'), objH = inRow('Objectif'), planH = inRow('Jours prévus');
+    if (!domH || !objH || !planH) return null;
+    const scoreH = first('Score du jour', (x) => x.row > R);
+    const weekH = first('Habitudes hebdomadaires', (x) => x.row > R);
+    const L = {
+      monthIdx: MONTHS.indexOf(norm(mCell.v)), year: yCell.v,
+      sectionCol: Math.min(timeH ? timeH.col : nameH.col, nameH.col) - 1,
+      timeCol: timeH ? timeH.col : null, nameCol: nameH.col, domainCol: domH.col, objCol: objH.col,
+      day1: objH.col + 1, plan1: planH.col,
+      firstRow: R + 2, lastRow: scoreH ? scoreH.row - 1 : R + 28,
+    };
+    if (weekH) {
+      const W = weekH.row; const wRow = (k) => first(k, (x) => x.row === W);
+      const sem = [1, 2, 3, 4, 5].map((i) => wRow('Sem. ' + i)).filter(Boolean).map((x) => x.col);
+      const mo = wRow('Habitudes à faire sur le mois');
+      const fait = first('Fait ?', (x) => x.row >= W - 2 && x.row <= W + 1);
+      const wTime = wRow('Heure'), wDom = wRow('Domaine'), wObj = wRow('Objectif');
+      L.weekly = { firstRow: W + 2, lastRow: W + 6, nameCol: weekH.col, timeCol: wTime ? wTime.col : null, domainCol: wDom ? wDom.col : weekH.col + 2, objCol: wObj ? wObj.col : null, sem };
+      if (mo && fait) L.monthly = { labelCol: mo.col, doneCol: fait.col };
+    }
+    return L;
+  }
+
+  function trackerModel(cells, sheetName, L) {
+    const { monthIdx, year } = L;
     const daysInMonth = new Date(year, monthIdx + 1, 0).getDate();
-    const weekdays = []; // weekday (1..7) of each day
+    const weekdays = []; // jour de semaine (1..7) de chaque date
     for (let d = 1; d <= daysInMonth; d++) weekdays.push(excelWeekday(new Date(year, monthIdx, d)));
     const countWeekday = (wd) => weekdays.filter((w) => w === wd).length;
+    const C = (col, row) => cells[numToCol(col) + row];
 
     const habits = []; let section = '';
-    for (let r = 16; r <= 42; r++) {
-      if (str(cells['B' + r])) section = str(cells['B' + r]);
-      const name = str(cells['C' + r]);
-      const planned = WEEKDAY_COLS.map((c) => Number(cells[c + r] && cells[c + r].v) === 1);
+    for (let r = L.firstRow; r <= L.lastRow; r++) {
+      if (str(C(L.sectionCol, r))) section = str(C(L.sectionCol, r));
+      const name = str(C(L.nameCol, r));
       if (!name) continue;
+      const usual = L.timeCol ? fmtTime(C(L.timeCol, r)) : '';
+      const planned = [], times = [];
+      for (let i = 0; i < 7; i++) {
+        const c = C(L.plan1 + i, r); const v = c && c.v;
+        const on = v != null && v !== '' && v !== 0;
+        planned.push(on);
+        times.push(on ? (typeof v === 'string' && fmtTime(c)) || usual : '');
+      }
       const checks = [];
-      for (let d = 1; d <= daysInMonth; d++) checks.push(isX(cells[numToCol(5 + d) + r]));
-      habits.push({ row: r, section, name, domain: str(cells['D' + r]), planned, checks });
+      for (let d = 1; d <= daysInMonth; d++) checks.push(isX(C(L.day1 + d - 1, r)));
+      habits.push({ row: r, section, name, time: usual, domain: str(C(L.domainCol, r)), planned, times, checks });
     }
 
     const weekly = []; const monthly = [];
-    for (let r = 48; r <= 52; r++) {
-      const name = str(cells['B' + r]);
-      if (name) {
-        const e = cells['E' + r]; let objective = 0;
-        const m = e && e.f ? /\$?(A[P-V])\$?13/.exec(e.f) : null;
-        if (m) objective = countWeekday(WEEKDAY_COLS.indexOf(m[1]) + 1);
-        else if (e && typeof e.v === 'number') objective = e.v;
-        weekly.push({ row: r, name, domain: str(cells['D' + r]), objective, weeks: WEEK_COLS.map((c) => isX(cells[c + r])) });
+    if (L.weekly) {
+      const W = L.weekly;
+      for (let r = W.firstRow; r <= W.lastRow; r++) {
+        const name = str(C(W.nameCol, r));
+        if (name) {
+          const e = W.objCol ? C(W.objCol, r) : null; let objective = 0, weekday = null;
+          const m = e && e.f ? /\$?([A-Z]{1,3})\$?\d+/.exec(e.f) : null;
+          if (m) { const idx = colToNum(m[1]) - L.plan1; if (idx >= 0 && idx < 7) { weekday = idx + 1; objective = countWeekday(weekday); } }
+          if (!weekday && e && typeof e.v === 'number') objective = e.v;
+          weekly.push({ row: r, name, time: W.timeCol ? fmtTime(C(W.timeCol, r)) : '', weekday, domain: str(C(W.domainCol, r)), objective, weeks: W.sem.map((col) => isX(C(col, r))) });
+        }
+        if (L.monthly) { const task = str(C(L.monthly.labelCol, r)); if (task) monthly.push({ row: r, name: task, done: isX(C(L.monthly.doneCol, r)) }); }
       }
-      const task = str(cells['AB' + r]);
-      if (task) monthly.push({ row: r, name: task, done: isX(cells['AL' + r]) });
     }
-    return { sheetName, monthIdx, monthName: MONTHS_FR[monthIdx], year, daysInMonth, weekdays, habits, weekly, monthly };
+    const cols = { day1: L.day1, week: L.weekly ? L.weekly.sem.map(numToCol) : [], monthDone: L.monthly ? numToCol(L.monthly.doneCol) : null };
+    return { sheetName, monthIdx, monthName: MONTHS_FR[monthIdx], year, daysInMonth, weekdays, habits, weekly, monthly, cols, hasTimes: !!L.timeCol };
   }
 
   function planningModel(cells) {
@@ -133,11 +193,12 @@
     const trackers = [];
     for (const s of wb.sheets) {
       const cells = await readSheet(wb, s.name);
-      if (looksLikeTracker(cells)) trackers.push(trackerModel(cells, s.name));
+      const L = cells && layout(cells);
+      if (L && L.monthIdx >= 0) trackers.push(trackerModel(cells, s.name, L));
     }
     const planSheet = wb.sheets.find((s) => /planning/i.test(s.name));
     const planning = planSheet ? planningModel(await readSheet(wb, planSheet.name)) : null;
-    return { trackers, planning };
+    return { version: 2, trackers, planning };
   }
 
   /* ---------- Écriture d'une cellule dans le XML, sans rien toucher d'autre ---------- */
@@ -195,5 +256,5 @@
     return wb.zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
   }
 
-  global.XL = { openWorkbook, buildModel, applyEdits, setCell, numToCol, colToNum, MONTHS_FR, norm, excelWeekday };
+  global.XL = { MODEL_VERSION: 2, timeMinutes, openWorkbook, buildModel, applyEdits, setCell, numToCol, colToNum, MONTHS_FR, norm, excelWeekday };
 })(typeof window !== 'undefined' ? window : globalThis);
