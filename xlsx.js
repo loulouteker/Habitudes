@@ -114,9 +114,16 @@
       const sem = [1, 2, 3, 4, 5].map((i) => wRow('Sem. ' + i)).filter(Boolean).map((x) => x.col);
       const mo = wRow('Habitudes à faire sur le mois');
       const fait = first('Fait ?', (x) => x.row >= W - 2 && x.row <= W + 1);
-      const wTime = wRow('Heure'), wDom = wRow('Domaine'), wObj = wRow('Objectif');
-      L.weekly = { firstRow: W + 2, lastRow: W + 6, nameCol: weekH.col, timeCol: wTime ? wTime.col : null, domainCol: wDom ? wDom.col : weekH.col + 2, objCol: wObj ? wObj.col : null, sem };
-      if (mo && fait) L.monthly = { labelCol: mo.col, doneCol: fait.col };
+      const wTime = wRow('Heure'), wDom = wRow('Domaine'), wObj = wRow('Objectif'), wPlan = wRow('Jours prévus');
+      L.weekly = { firstRow: W + 2, lastRow: W + 6, nameCol: weekH.col, timeCol: wTime ? wTime.col : null, domainCol: wDom ? wDom.col : weekH.col + 2, objCol: wObj ? wObj.col : null, plan1: wPlan ? wPlan.col : null, sem };
+      if (mo && fait) L.monthly = { firstRow: W + 2, lastRow: W + 6, labelCol: mo.col, doneCol: fait.col };
+      // Nouveau format : tableau « Habitudes du mois » séparé, sous les hebdomadaires
+      const mH = first('Habitudes du mois', (x) => x.row > W);
+      if (mH) {
+        const M = mH.row; const mRow = (k) => first(k, (x) => x.row === M);
+        const f = mRow('Fait ?'), mt = mRow('Heure'), md = mRow('Domaine'), ms = mRow('Semaine'), mp = mRow('Jours prévus');
+        if (f) L.monthly = { firstRow: M + 2, lastRow: M + 6, labelCol: mH.col, doneCol: f.col, timeCol: mt ? mt.col : null, domainCol: md ? md.col : null, weekCol: ms ? ms.col : null, plan1: mp ? mp.col : null };
+      }
     }
     return L;
   }
@@ -148,18 +155,50 @@
     }
 
     const weekly = []; const monthly = [];
+    // Jours prévus (1 = heure habituelle, « 9h30 » = autre heure ce jour-là)
+    const readDays = (r, plan1, usual) => {
+      const on = [], times = [];
+      for (let i = 0; i < 7; i++) { const c = C(plan1 + i, r); const v = c && c.v; const ok = v != null && v !== '' && v !== 0; on.push(ok); times.push(ok ? (typeof v === 'string' && fmtTime(c)) || usual : ''); }
+      return { on, times };
+    };
     if (L.weekly) {
       const W = L.weekly;
       for (let r = W.firstRow; r <= W.lastRow; r++) {
         const name = str(C(W.nameCol, r));
-        if (name) {
-          const e = W.objCol ? C(W.objCol, r) : null; let objective = 0, weekday = null;
+        if (!name) continue;
+        const time = W.timeCol ? fmtTime(C(W.timeCol, r)) : '';
+        let days = [false, false, false, false, false, false, false], times = ['', '', '', '', '', '', ''], objective = 0;
+        if (W.plan1) ({ on: days, times } = readDays(r, W.plan1, time));
+        if (days.some(Boolean)) objective = Math.max(...days.map((on, i) => (on ? countWeekday(i + 1) : 0))); // = formule du fichier
+        else {
+          const e = W.objCol ? C(W.objCol, r) : null;
           const m = e && e.f ? /\$?([A-Z]{1,3})\$?\d+/.exec(e.f) : null;
-          if (m) { const idx = colToNum(m[1]) - L.plan1; if (idx >= 0 && idx < 7) { weekday = idx + 1; objective = countWeekday(weekday); } }
-          if (!weekday && e && typeof e.v === 'number') objective = e.v;
-          weekly.push({ row: r, name, time: W.timeCol ? fmtTime(C(W.timeCol, r)) : '', weekday, domain: str(C(W.domainCol, r)), objective, weeks: W.sem.map((col) => isX(C(col, r))) });
+          const idx = m ? colToNum(m[1]) - L.plan1 : -1;
+          if (idx >= 0 && idx < 7) { days[idx] = true; times[idx] = time; objective = countWeekday(idx + 1); }
+          else if (e && typeof e.v === 'number') objective = e.v;
         }
-        if (L.monthly) { const task = str(C(L.monthly.labelCol, r)); if (task) monthly.push({ row: r, name: task, done: isX(C(L.monthly.doneCol, r)) }); }
+        const wd = days.indexOf(true);
+        weekly.push({ row: r, name, time, days, times, weekday: wd >= 0 ? wd + 1 : null, domain: str(C(W.domainCol, r)), objective, weeks: W.sem.map((col) => isX(C(col, r))) });
+      }
+    }
+    if (L.monthly) {
+      const M = L.monthly;
+      for (let r = M.firstRow; r <= M.lastRow; r++) {
+        const task = str(C(M.labelCol, r)); if (!task) continue;
+        const time = M.timeCol ? fmtTime(C(M.timeCol, r)) : '';
+        let date = null, weekday = null, dtime = time;
+        if (M.plan1) {
+          const { on, times } = readDays(r, M.plan1, time);
+          const i = on.indexOf(true);
+          if (i >= 0) {
+            weekday = i + 1; dtime = times[i];
+            const wk = M.weekCol ? str(C(M.weekCol, r)) : '';
+            const occ = []; weekdays.forEach((w, k) => { if (w === weekday) occ.push(k + 1); });
+            if (norm(wk) === 'derniere') date = occ[occ.length - 1];
+            else if (+wk >= 1) date = occ[+wk - 1] || null; // même règle que la colonne « Date »
+          }
+        }
+        monthly.push({ row: r, name: task, done: isX(C(M.doneCol, r)), time: dtime, domain: M.domainCol ? str(C(M.domainCol, r)) : '', weekday, date });
       }
     }
     const cols = { day1: L.day1, week: L.weekly ? L.weekly.sem.map(numToCol) : [], monthDone: L.monthly ? numToCol(L.monthly.doneCol) : null };
@@ -198,7 +237,7 @@
     }
     const planSheet = wb.sheets.find((s) => /planning/i.test(s.name));
     const planning = planSheet ? planningModel(await readSheet(wb, planSheet.name)) : null;
-    return { version: 2, trackers, planning };
+    return { version: 3, trackers, planning };
   }
 
   /* ---------- Écriture d'une cellule dans le XML, sans rien toucher d'autre ---------- */
@@ -256,5 +295,5 @@
     return wb.zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
   }
 
-  global.XL = { MODEL_VERSION: 2, timeMinutes, openWorkbook, buildModel, applyEdits, setCell, numToCol, colToNum, MONTHS_FR, norm, excelWeekday };
+  global.XL = { MODEL_VERSION: 3, timeMinutes, openWorkbook, buildModel, applyEdits, setCell, numToCol, colToNum, MONTHS_FR, norm, excelWeekday };
 })(typeof window !== 'undefined' ? window : globalThis);

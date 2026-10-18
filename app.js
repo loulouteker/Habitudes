@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   const CFG = window.APP_CONFIG || {};
-  const VERSION = '1.2';
+  const VERSION = '1.3';
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const SCOPE = 'openid profile offline_access User.Read Files.ReadWrite';
   const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -25,9 +25,9 @@
     user: store.get('user', null),
     file: store.get('file', null), // {id, name}
     sheet: store.get('sheet', null),
-    model: (store.get('model', null) || {}).version === 2 ? store.get('model', null) : null,
+    model: (store.get('model', null) || {}).version === 3 ? store.get('model', null) : null,
     loadedAt: store.get('loadedAt', 0),
-    pending: (store.get('model', null) || {}).version === 2 ? store.get('pending', {}) : {},
+    pending: (store.get('model', null) || {}).version === 3 ? store.get('pending', {}) : {},
     view: 'today', day: null, planDay: null,
     showUnplanned: false, modal: null, browse: null,
     sync: 'idle', syncMsg: '', needLogin: false,
@@ -297,6 +297,18 @@
     return `<div class="ring" style="width:${size}px;height:${size}px"><svg width="${size}" height="${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--faint)" stroke-width="${stroke}"/><circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--green)" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - Math.min(1, v))}" style="transition:stroke-dashoffset .5s"/></svg><div class="lbl">${inner}</div></div>`;
   };
 
+  /* Habitudes hebdo / du mois prévues un jour donné (la n-ième occurrence du jour = « Sem. n ») */
+  const wkTimes = (w) => w.times || (w.weekday ? DAYS_LONG.map((_, i) => (i + 1 === w.weekday ? w.time : '')) : []);
+  const wkDays = (w) => w.days || DAYS_LONG.map((_, i) => i + 1 === w.weekday);
+  function extrasOn(t, d) {
+    if (!d) return [];
+    const wd = t.weekdays[d - 1], wi = Math.ceil(d / 7) - 1, out = [];
+    t.weekly.forEach((w) => { if (wkDays(w)[wd - 1] && wi < (t.cols.week || []).length) out.push({ kind: 'week', row: w.row, w: wi, name: w.name, domain: w.domain, time: wkTimes(w)[wd - 1] || w.time, done: w.weeks[wi], tag: 'hebdo · sem. ' + (wi + 1) }); });
+    t.monthly.forEach((m) => { if (m.date === d && t.cols.monthDone) out.push({ kind: 'monthly', row: m.row, name: m.name, domain: m.domain, time: m.time, done: m.done, tag: 'du mois' }); });
+    return out.sort((a, b) => XL.timeMinutes(a.time) - XL.timeMinutes(b.time));
+  }
+  const extraAttrs = (x) => (x.kind === 'week' ? `data-act="week" data-row="${x.row}" data-w="${x.w}"` : `data-act="monthly" data-row="${x.row}"`);
+
   /* ---------- Vues ---------- */
   function vToday(t, st) {
     if (S.day == null || S.day > t.daysInMonth) S.day = todayInMonth(t) || 1;
@@ -322,6 +334,10 @@
         <div><div class="msg">${dayMsg(v, planned.length)}</div><div class="sub">${d === tday ? "Aujourd'hui" : DAYS_LONG[wd - 1] + ' ' + d + ' ' + MONTHS_LOWER[t.monthIdx]}${isFuture(t, d) ? ' · à venir' : ''}</div></div></div>
       ${sections.map((s) => `<h2>${esc(prettySection(s.name))}</h2><div class="list">${s.items.map((h) => row(h)).join('')}</div>`).join('')}
       ${!planned.length ? '<div class="empty">Aucune habitude prévue ce jour-là.</div>' : ''}
+      ${(() => { const ex = extrasOn(t, d); return ex.length ? `<h2>Aussi ce jour-là</h2><div class="list">${ex.map((x) => `<button class="habit ${x.done ? 'done' : ''}" ${extraAttrs(x)}>
+        <span class="dot" style="background:${color(x.domain)}"></span>
+        <span class="nm"><b>${esc(x.name)}</b><small>${esc([x.time, x.tag].filter(Boolean).join(' · '))}</small></span>
+        <span class="check">${ICON.check}</span></button>`).join('')}</div>` : ''; })()}
       ${unplanned.length ? `<button class="disclose" data-act="unplanned">${S.showUnplanned ? 'Masquer' : 'Afficher'} les habitudes non prévues ce jour (${unplanned.length})</button>
         ${S.showUnplanned ? `<div class="list" style="margin-top:8px">${unplanned.map((h) => row(h, 'unplanned')).join('')}</div>` : ''}` : ''}`;
   }
@@ -347,8 +363,8 @@
       <h2>Chaque habitude</h2>
       <div class="card" style="padding:4px 14px">${st.habits.map((h) => {
         const v = pct(h.done, h.objective);
-        return `<button class="hrow" data-act="habit" data-row="${h.row}"><div class="l1">${esc(h.name)}<span>${h.done} / ${h.objective}</span></div>
-          <div class="meter"><span style="width:${Math.round(v * 100)}%;background:${color(h.domain)}"></span></div><small>${habitMsg(v)}</small></button>`;
+        return `<button class="hrow" data-act="habit" data-row="${h.row}"><div class="l1">${esc(h.name)}<span>${h.objective ? h.done + ' / ' + h.objective : 'pas prévue'}</span></div>
+          <div class="meter"><span style="width:${Math.round(v * 100)}%;background:${color(h.domain)}"></span></div><small>${h.objective ? habitMsg(v) : 'Aucun jour prévu dans « Jours prévus »'}</small></button>`;
       }).join('')}</div>`;
   }
 
@@ -357,11 +373,11 @@
     return `
       <h2 style="margin-top:12px">Habitudes hebdomadaires</h2>
       ${t.weekly.length ? t.weekly.map((w) => `<div class="card goal"><div class="l1"><b>${esc(w.name)}</b><span>${w.weeks.filter(Boolean).length} / ${w.objective}</span></div>
-        <div style="font-size:12.5px;color:var(--muted);margin-top:2px"><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color(w.domain)};margin-right:6px"></span>${esc([w.domain, w.weekday ? DAYS_LONG[w.weekday - 1] + (w.time ? ' ' + w.time : '') : w.time].filter(Boolean).join(' · '))}</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-top:2px"><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color(w.domain)};margin-right:6px"></span>${esc([w.domain, wkDays(w).map((on, i) => (on ? DAYS_LONG[i] + ((wkTimes(w)[i] || w.time) ? ' ' + (wkTimes(w)[i] || w.time) : '') : '')).filter(Boolean).join(', ') || w.time].filter(Boolean).join(' · '))}</div>
         <div class="weeks">${w.weeks.map((on, i) => `<button class="wk ${on ? 'on' : ''} ${i + 1 === curWeek ? 'cur' : ''}" data-act="week" data-row="${w.row}" data-w="${i}">S${i + 1}</button>`).join('')}</div></div>`).join('')
         : '<div class="empty card">Aucune habitude hebdomadaire dans le fichier.</div>'}
       <h2>À faire ce mois-ci</h2>
-      <div class="card" style="padding:2px 0">${t.monthly.length ? t.monthly.map((m) => `<button class="todo ${m.done ? 'on' : ''}" data-act="monthly" data-row="${m.row}"><span class="box">${ICON.check}</span><span>${esc(m.name)}</span></button>`).join('') : '<div class="empty">Rien de prévu ce mois-ci.</div>'}</div>`;
+      <div class="card" style="padding:2px 0">${t.monthly.length ? t.monthly.map((m) => `<button class="todo ${m.done ? 'on' : ''}" data-act="monthly" data-row="${m.row}"><span class="box">${ICON.check}</span><span>${esc(m.name)}${m.date ? `<small style="display:block;color:var(--muted);font-size:12.5px;text-decoration:none">${DAYS_LONG[t.weekdays[m.date - 1] - 1]} ${m.date} ${MONTHS_LOWER[t.monthIdx]}${m.time ? ' · ' + m.time : ''}</small>` : ''}</span></button>`).join('') : '<div class="empty">Rien de prévu ce mois-ci.</div>'}</div>`;
   }
 
   function vPlan(t) {
@@ -376,7 +392,8 @@
     const d = date.getFullYear() === t.year && date.getMonth() === t.monthIdx ? date.getDate() : null;
     const items = [];
     t.habits.forEach((h) => { if (h.planned[wd - 1]) items.push({ time: h.times[wd - 1], label: h.name, domain: h.domain, row: h.row, done: d ? h.checks[d - 1] : null }); });
-    t.weekly.forEach((w) => { if (w.weekday === wd) items.push({ time: w.time, label: w.name, domain: w.domain, weekly: true }); });
+    if (d) extrasOn(t, d).forEach((x) => items.push({ time: x.time, label: x.name, domain: x.domain, extra: x, tag: x.tag }));
+    else t.weekly.forEach((w) => { if (wkDays(w)[wd - 1]) items.push({ time: wkTimes(w)[wd - 1] || w.time, label: w.name, domain: w.domain, tag: 'hebdo' }); });
     items.sort((a, b) => XL.timeMinutes(a.time) - XL.timeMinutes(b.time));
     let nowIdx = -1;
     if (wd === todayWd) items.forEach((it, i) => { if (XL.timeMinutes(it.time) <= nowM) nowIdx = i; });
@@ -384,8 +401,9 @@
       <h2>${DAYS_LONG[wd - 1]} ${date.getDate()} ${MONTHS_LOWER[date.getMonth()]}</h2>
       <div class="card"><div class="timeline">${items.length ? items.map((it, i) => `<div class="ti ${i === nowIdx ? 'now' : ''} ${nowIdx >= 0 && i < nowIdx ? 'past' : ''}">
         <time>${esc(it.time || '—')}</time><span class="pt" style="border-color:${color(it.domain)}"></span>
-        <span>${i === nowIdx ? '<b>En ce moment</b>' : ''}${esc(it.label)}${it.weekly ? ' <small style="color:var(--muted)">· hebdo</small>' : ''}</span>
-        ${it.done != null ? `<button class="tick ${it.done ? 'on' : ''}" data-act="toggle" data-row="${it.row}" data-day="${d}" aria-label="Cocher">${ICON.check}</button>` : '<span></span>'}</div>`).join('')
+        <span>${i === nowIdx ? '<b>En ce moment</b>' : ''}${esc(it.label)}${it.tag ? ` <small style="color:var(--muted)">· ${esc(it.tag)}</small>` : ''}</span>
+        ${it.extra ? `<button class="tick ${it.extra.done ? 'on' : ''}" ${extraAttrs(it.extra)} aria-label="Cocher">${ICON.check}</button>`
+          : it.done != null ? `<button class="tick ${it.done ? 'on' : ''}" data-act="toggle" data-row="${it.row}" data-day="${d}" aria-label="Cocher">${ICON.check}</button>` : '<span></span>'}</div>`).join('')
         : '<div class="empty">Rien de planifié ce jour-là.</div>'}</div></div>
       <p style="color:var(--muted);font-size:12.5px;text-align:center;margin-top:12px">Les heures viennent du Tracker : heure habituelle, ou heure du jour si vous en avez mis une.</p>`;
   }
